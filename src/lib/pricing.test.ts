@@ -39,3 +39,26 @@ describe("pricing engine", () => {
     expect(q.total).toBe(30);
   });
 });
+
+it("applies the AI technical tedium multiplier when provided", () => {
+  const q = computeQuote({
+    rate,
+    settings,
+    quantity: 10, // base = 50
+    complexity: "standard",
+    delivery: "soft",
+    deadline: in30days,
+    now,
+    aiMultiplier: 1.9,
+    aiTediumScore: 9,
+    aiReasoning: "Involves complex control systems MATLAB modeling.",
+  });
+  // Base = 50. Complexity adjustment with 1.9 multiplier adds: 50 * (1.9 - 1) = 45. Total = 95.
+  expect(q.total).toBe(95);
+  expect(
+    q.lines.some((line) => line.label.includes("AI Technical Tedium Analysis (Score: 9/10")),
+  ).toBe(true);
+  expect(q.aiEvaluationSummary?.reasoning).toBe(
+    "Involves complex control systems MATLAB modeling.",
+  );
+});

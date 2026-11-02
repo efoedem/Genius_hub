@@ -27,7 +27,7 @@ export const getPricing = createServerFn({ method: "GET" }).handler(async () => 
 });
 
 export const checkReturning = createServerFn({ method: "POST" })
-  .inputValidator((d: unknown) => z.object({ email: z.string().email().max(255) }).parse(d))
+  .validator((d: unknown) => z.object({ email: z.string().email().max(255) }).parse(d))
   .handler(async ({ data }) => {
     const { findClientByEmail } = await import("./data/clients.server");
     const c = await findClientByEmail(data.email);
@@ -50,7 +50,7 @@ const orderSchema = z.object({
 });
 
 export const createOrder = createServerFn({ method: "POST" })
-  .inputValidator((d: unknown) => orderSchema.parse(d))
+  .validator((d: unknown) => orderSchema.parse(d))
   .handler(async ({ data }) => {
     const [pricing, clients, orders, files, paystack] = await Promise.all([
       import("./data/pricing.server"),
@@ -60,14 +60,33 @@ export const createOrder = createServerFn({ method: "POST" })
       import("./paystack.server"),
     ]);
     const deadline = new Date(data.deadline);
-    if (deadline.getTime() < Date.now() + 3 * 36e5) throw new Error("Deadline must be at least 3 hours from now");
+
+    if (deadline.getTime() < Date.now() + 3 * 36e5)
+      throw new Error("Deadline must be at least 3 hours from now");
+
     const userId = await optionalUserId();
     const [rates, settings] = await Promise.all([pricing.getRates(), pricing.getSettings()]);
     const rate = rates.find((r) => r.service_key === data.service_key);
     if (!rate) throw new Error("Unknown service");
-    const { client, isReturning } = await clients.upsertClient({ email: data.email, name: data.name, phone: data.phone, userId });
+
+    const { client, isReturning } = await clients.upsertClient({
+      email: data.email,
+      name: data.name,
+      phone: data.phone,
+      userId,
+    });
+
     // Authoritative price — always computed on the server.
-    const quote = computeQuote({ rate, settings, quantity: data.quantity, complexity: data.complexity, delivery: data.delivery_format, deadline, isReturning });
+    const quote = computeQuote({
+      rate,
+      settings,
+      quantity: data.quantity,
+      complexity: data.complexity,
+      delivery: data.delivery_format,
+      deadline,
+      isReturning,
+    });
+
     const order = await orders.createOrder({
       user_id: userId,
       client_id: client.id,
@@ -84,8 +103,25 @@ export const createOrder = createServerFn({ method: "POST" })
       breakdown: quote.lines as unknown as import("@/integrations/supabase/types").Json,
       is_repeat: isReturning,
     });
+
     await files.attachFiles(order.id, "input", data.files);
     await clients.incrementOrderCount(client.id);
+
+    // Safely trigger email in the background without blocking order completion
+    try {
+      const emailService = await import("./email");
+      emailService
+        .sendOrderEmail({
+          toEmail: order.client_email,
+          orderId: order.tracking_id,
+          serviceName: data.service_key,
+          totalAmount: Number(order.amount).toFixed(2),
+          status: "received",
+        })
+        .catch((err) => console.warn("Email dispatch warning:", err));
+    } catch (emailErr) {
+      console.warn("Email module not found or skipped:", emailErr);
+    }
 
     let paymentUrl: string | null = null;
     let paymentError: string | null = null;
@@ -104,11 +140,18 @@ export const createOrder = createServerFn({ method: "POST" })
         paymentError = e instanceof Error ? e.message : "Payment could not start";
       }
     }
-    return { trackingId: order.tracking_id, amount: Number(order.amount), paymentUrl, paymentConfigured: paystack.paystackConfigured(), paymentError };
+
+    return {
+      trackingId: order.tracking_id,
+      amount: Number(order.amount),
+      paymentUrl,
+      paymentConfigured: paystack.paystackConfigured(),
+      paymentError,
+    };
   });
 
 export const retryPayment = createServerFn({ method: "POST" })
-  .inputValidator((d: unknown) => z.object({ trackingId: z.string().max(20) }).parse(d))
+  .validator((d: unknown) => z.object({ trackingId: z.string().max(20) }).parse(d))
   .handler(async ({ data }) => {
     const orders = await import("./data/orders.server");
     const paystack = await import("./paystack.server");
@@ -116,32 +159,53 @@ export const retryPayment = createServerFn({ method: "POST" })
     if (!order || order.payment_status === "paid") return { paymentUrl: null };
     if (!paystack.paystackConfigured()) return { paymentUrl: null };
     const reference = `${order.tracking_id}-${Date.now()}`;
-    const url = await paystack.initializeTransaction({ email: order.client_email, amount: Number(order.amount), reference, orderId: order.id, callbackUrl: `${originOf()}/order/${order.tracking_id}` });
+    const url = await paystack.initializeTransaction({
+      email: order.client_email,
+      amount: Number(order.amount),
+      reference,
+      orderId: order.id,
+      callbackUrl: `${originOf()}/order/${order.tracking_id}`,
+    });
     await orders.setPaymentRef(order.id, reference);
     return { paymentUrl: url };
   });
 
 export const verifyPayment = createServerFn({ method: "POST" })
-  .inputValidator((d: unknown) => z.object({ reference: z.string().max(80) }).parse(d))
+  .validator((d: unknown) => z.object({ reference: z.string().max(80) }).parse(d))
   .handler(async ({ data }) => {
     const paystack = await import("./paystack.server");
     const tx = await paystack.verifyTransaction(data.reference);
     if (!tx || tx.status !== "success" || !tx.metadata?.order_id) return { paid: false };
-    const ok = await paystack.settlePayment(tx.metadata.order_id, data.reference, tx.amount, originOf());
+    const ok = await paystack.settlePayment(
+      tx.metadata.order_id,
+      data.reference,
+      tx.amount,
+      originOf(),
+    );
     return { paid: ok };
   });
 
 export const trackOrder = createServerFn({ method: "POST" })
-  .inputValidator((d: unknown) => z.object({ trackingId: z.string().trim().min(4).max(20) }).parse(d))
+  .validator((d: unknown) => z.object({ trackingId: z.string().trim().min(4).max(20) }).parse(d))
   .handler(async ({ data }) => {
     const orders = await import("./data/orders.server");
     const files = await import("./data/files.server");
     const o = await orders.getOrderByTracking(data.trackingId);
     if (!o) return null;
-    const [events, outputs, inputs] = await Promise.all([orders.listEvents(o.id), files.listFiles(o.id, "output"), files.listFiles(o.id, "input")]);
+    const [events, outputs, inputs] = await Promise.all([
+      orders.listEvents(o.id),
+      files.listFiles(o.id, "output"),
+      files.listFiles(o.id, "input"),
+    ]);
     const downloads =
       o.status === "completed" && o.payment_status === "paid"
-        ? await Promise.all(outputs.map(async (f) => ({ name: f.name, size: f.size, url: await files.signedUrl(f.path) })))
+        ? await Promise.all(
+            outputs.map(async (f) => ({
+              name: f.name,
+              size: f.size,
+              url: await files.signedUrl(f.path),
+            })),
+          )
         : [];
     return {
       trackingId: o.tracking_id,
@@ -211,7 +275,7 @@ export const adminListOrders = createServerFn({ method: "GET" })
 
 export const adminFileUrl = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => z.object({ path: z.string().max(400) }).parse(d))
+  .validator((d: unknown) => z.object({ path: z.string().max(400) }).parse(d))
   .handler(async ({ context, data }) => {
     await assertAdmin(context);
     const files = await import("./data/files.server");
@@ -220,23 +284,50 @@ export const adminFileUrl = createServerFn({ method: "POST" })
 
 export const adminSetStatus = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => z.object({ orderId: z.string().uuid(), status: z.enum(["received", "in_progress", "completed"]) }).parse(d))
+  .validator((d: unknown) =>
+    z
+      .object({
+        orderId: z.string().uuid(),
+        status: z.enum(["received", "in_progress", "completed"]),
+      })
+      .parse(d),
+  )
   .handler(async ({ context, data }) => {
     await assertAdmin(context);
     const orders = await import("./data/orders.server");
     await orders.setStatus(data.orderId, data.status);
+
     if (data.status === "completed") {
       const { emailClient } = await import("./notify.server");
       const o = await orders.getOrder(data.orderId);
-      if (o) await emailClient({ ...o, amount_paid: Number(o.amount_paid) }, "ready", originOf());
+      if (o) {
+        await emailClient({ ...o, amount_paid: Number(o.amount_paid) }, "ready", originOf());
+      }
     }
     return { ok: true };
   });
 
+
 export const adminAddOutputs = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) =>
-    z.object({ orderId: z.string().uuid(), files: z.array(z.object({ path: z.string().regex(/^outputs\//).max(400), name: z.string().max(255), size: z.number().int() })).max(20) }).parse(d),
+  .validator((d: unknown) =>
+    z
+      .object({
+        orderId: z.string().uuid(),
+        files: z
+          .array(
+            z.object({
+              path: z
+                .string()
+                .regex(/^outputs\//)
+                .max(400),
+              name: z.string().max(255),
+              size: z.number().int(),
+            }),
+          )
+          .max(20),
+      })
+      .parse(d),
   )
   .handler(async ({ context, data }) => {
     await assertAdmin(context);
@@ -247,7 +338,7 @@ export const adminAddOutputs = createServerFn({ method: "POST" })
 
 export const adminDeleteFile = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => z.object({ fileId: z.string().uuid() }).parse(d))
+  .validator((d: unknown) => z.object({ fileId: z.string().uuid() }).parse(d))
   .handler(async ({ context, data }) => {
     await assertAdmin(context);
     const files = await import("./data/files.server");
@@ -258,7 +349,7 @@ export const adminDeleteFile = createServerFn({ method: "POST" })
 const num = z.number().min(0).max(100000);
 export const adminUpdatePricing = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) =>
+  .validator((d: unknown) =>
     z
       .object({
         rates: z.array(z.object({ service_key: z.string(), base_rate: num, floor_price: num })),
@@ -280,7 +371,8 @@ export const adminUpdatePricing = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     await assertAdmin(context);
     const p = await import("./data/pricing.server");
-    for (const r of data.rates) await p.updateRate(r.service_key, { base_rate: r.base_rate, floor_price: r.floor_price });
+    for (const r of data.rates)
+      await p.updateRate(r.service_key, { base_rate: r.base_rate, floor_price: r.floor_price });
     await p.updateSettings(data.settings);
     return { ok: true };
   });

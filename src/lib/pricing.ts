@@ -1,5 +1,4 @@
-// Rule-based pricing engine. Pure functions only — shared by the browser
-// (live quote preview) and the server (authoritative price on order creation).
+// Rule-based pricing engine with pure AI dynamic calculation (No floor limits).
 
 export type Complexity = "standard" | "advanced" | "expert";
 export type DeliveryFormat = "soft" | "hard";
@@ -9,7 +8,7 @@ export interface ServiceRate {
   label: string;
   unit_label: string;
   base_rate: number;
-  floor_price: number;
+  floor_price: number; // Kept in interface for DB compatibility, but ignored in calculation
   sort_order?: number;
 }
 
@@ -35,6 +34,9 @@ export interface QuoteInput {
   deadline: Date;
   now?: Date;
   isReturning?: boolean;
+  aiMultiplier?: number;
+  aiReasoning?: string;
+  aiTediumScore?: number;
 }
 
 export interface QuoteLine {
@@ -47,6 +49,10 @@ export interface Quote {
   total: number;
   urgencyPct: number;
   hoursUntilDeadline: number;
+  aiEvaluationSummary?: {
+    tediumScore: number;
+    reasoning: string;
+  };
 }
 
 const round = (n: number) => Math.round(n * 100) / 100;
@@ -68,25 +74,49 @@ export function printingCost(pages: number, s: PricingSettings): number {
 }
 
 export function computeQuote(input: QuoteInput): Quote {
-  const { rate, settings: s, complexity, delivery } = input;
+  const { rate, settings: s, delivery } = input;
   const qty = Math.max(1, Math.floor(input.quantity || 1));
   const now = input.now ?? new Date();
   const hours = Math.max(0, (input.deadline.getTime() - now.getTime()) / 36e5);
   const lines: QuoteLine[] = [];
 
   const base = round(qty * Number(rate.base_rate));
-  lines.push({ label: `${rate.label} — ${qty} × GH₵${Number(rate.base_rate).toFixed(2)} per ${rate.unit_label}`, amount: base });
 
-  const mult =
-    complexity === "expert"
+  // Determine multiplier
+  const manualMult =
+    input.complexity === "expert"
       ? Number(s.complexity_expert)
-      : complexity === "advanced"
+      : input.complexity === "advanced"
         ? Number(s.complexity_advanced)
         : Number(s.complexity_standard);
-  const complexityAdj = round(base * (mult - 1));
-  if (complexityAdj !== 0) lines.push({ label: `Complexity (${complexity}, ×${mult})`, amount: complexityAdj });
 
-  let work = base + complexityAdj;
+  const mult = input.aiMultiplier !== undefined ? input.aiMultiplier : manualMult;
+
+  // Fully dynamic AI or manual scope line item
+  if (input.aiMultiplier !== undefined && input.aiMultiplier > 1.0) {
+    const aiAdjustedBase = round(base * mult);
+    lines.push({
+      label: `${rate.label} — AI Dynamic Scope (Tedium Score: ${input.aiTediumScore || "N/A"}/10, ×${mult})`,
+      amount: aiAdjustedBase,
+    });
+  } else {
+    lines.push({
+      label: `${rate.label} — ${qty} × GH₵${Number(rate.base_rate).toFixed(2)} per ${rate.unit_label}`,
+      amount: base,
+    });
+
+    const complexityAdj = round(base * (mult - 1));
+    if (complexityAdj !== 0) {
+      lines.push({ label: `Complexity (${input.complexity}, ×${mult})`, amount: complexityAdj });
+    }
+  }
+
+  let work =
+    input.aiMultiplier !== undefined && input.aiMultiplier > 1.0
+      ? round(base * mult)
+      : base + round(base * (mult - 1));
+
+  // Urgency surcharge
   const urgencyPct = urgencyPctFor(hours, s);
   if (urgencyPct > 0) {
     const u = round(work * (urgencyPct / 100));
@@ -94,11 +124,8 @@ export function computeQuote(input: QuoteInput): Quote {
     work += u;
   }
 
-  const floor = Number(rate.floor_price);
-  if (work < floor) {
-    lines.push({ label: "Minimum service charge adjustment", amount: round(floor - work) });
-    work = floor;
-  }
+  // NOTE: Minimum service charge floor check has been completely removed.
+  // All amounts reflect exact calculations based on quantity, AI multipliers, and urgency.
 
   let total = work;
   if (delivery === "hard") {
@@ -110,15 +137,25 @@ export function computeQuote(input: QuoteInput): Quote {
   if (input.isReturning && Number(s.returning_discount_pct) > 0) {
     const pct = Number(s.returning_discount_pct);
     let d = round(total * (pct / 100));
-    if (total - d < floor) d = round(Math.max(0, total - floor));
     if (d > 0) {
       lines.push({ label: `Returning client discount (−${pct}%)`, amount: -d });
       total -= d;
     }
   }
 
-  total = round(Math.max(total, floor));
-  return { lines, total, urgencyPct, hoursUntilDeadline: hours };
+  total = round(total);
+  return {
+    lines,
+    total,
+    urgencyPct,
+    hoursUntilDeadline: hours,
+    aiEvaluationSummary: input.aiReasoning
+      ? {
+          tediumScore: input.aiTediumScore || 5,
+          reasoning: input.aiReasoning,
+        }
+      : undefined,
+  };
 }
 
 export const formatGHS = (n: number) =>

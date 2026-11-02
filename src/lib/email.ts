@@ -33,9 +33,6 @@ export async function sendOrderEmail({
 
   const callToActionText = isCompleted ? "Download Completed Work" : "View Order Portal";
 
-  // Create a unique key using the order ID, status, and current timestamp
-  const idempotencyKey = `email-${orderId}-${status}-${Date.now()}`;
-
   try {
     const { data, error } = await resend.emails.send(
       {
@@ -61,8 +58,10 @@ export async function sendOrderEmail({
         `,
       },
       {
-        // Add options with unique idempotencyKey header
-        idempotencyKey,
+        // Prevent 409 idempotency conflict by forcing a unique header per request
+        headers: {
+          "Idempotency-Key": `${orderId}-${status}-${Date.now()}-${Math.random()}`,
+        },
       }
     );
 
